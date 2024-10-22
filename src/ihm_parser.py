@@ -285,3 +285,41 @@ def parse_ihm_models( args ):
 					print( "Creating patch coloured model..." )
 					# get_patch_coloured_rmf( f"output_{ist}_{img}", coords, mass, radius )
 					ihm_set_bfactor( f"output_{ist}_{img}", mmcif, mg )
+
+
+def get_all_attributes_ihm(models) -> list:
+	"""Extract information from models in an ihm.model.ModelGroup"""
+    # Get the x, y, z coords and radius for all models.
+	coords, radius, mass, ps_names = [], [], [], []
+	avg_mass = 110
+	avg_radius = 2.73
+
+	# iterate over all models in the model group.
+	num_models = 0
+	for m in models:
+		num_models += 1
+		num_spheres = 0
+		a = 0
+		# iterate over all asym_units in a model.
+		objs = m._spheres + m._atoms
+		for obj in objs:
+			# Check if it is a sphere or atom object.
+			if isinstance(obj, ihm.model.Sphere) or (isinstance(obj, ihm.model.Atom) and obj.atom_id == 'CA'):
+				num_spheres += 1
+				coords.append( [obj.x, obj.y, obj.z])
+				try:
+					n_res = obj.seq_id_range
+					bead_mass = 110 if n_res[0] == n_res[1] else ( n_res[1] - n_res[0] + 1 )*110
+					mass.append( bead_mass )
+					radius.append( obj.radius )
+					ps_names.append('')
+				# non-IMP entries do not have a radius.
+				except AttributeError:
+					radius.append( avg_radius )
+					mass.append( avg_mass )
+					ps_names.append('')
+
+	coords = np.array( coords ).reshape( num_models, num_spheres, 3 )
+	radius = np.array( radius ).reshape( num_models*num_spheres, 1 )
+	mass = np.array( mass ).reshape( num_models*num_spheres, 1 )
+	return [coords, radius, mass, ps_names]
