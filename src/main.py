@@ -2,24 +2,22 @@ import numpy as np
 import pandas as pd
 import os
 from multiprocessing import Pool
-from functools import partial
 from sparse_grid import SparseGrid
 from bead_density import BeadDensity
 from patch_computer import calc_bead_spread, get_patches, annotate_patches
 from pdb_parser import parse_all_struct
 from utils import _get_bounding_box
 import argparse
-from ihm_parser import *
 import tqdm
 import logging
 
-def main_density_calc(i, coords, mass, radius, grid, voxel_size, n_breaks):
-	bead_density = BeadDensity(coords.shape[0], grid=grid, voxel_size=voxel_size)
-	# Obtain min-max coords for each bead across all models to construct a kernel.
+def main_density_calc(coords, mass, radius, bead_density, n_breaks):
+	# bead_density = BeadDensity(coords.shape[0], grid=grid, voxel_size=voxel_size)
+	# Obtain min-max coords for the bead across all models to construct a kernel.
 	# k1 --> min xyz coords of kernel; k2 --> max xyz coords of kernel.
-	k1, k2 = _get_bounding_box(coords[:,i,:])
+	k1, k2 = _get_bounding_box(coords)
 	bead_density.construct_kernel(k1,k2)
-	return bead_density.return_density_opt(coords[:,i,:], radius[i], mass[i], n_breaks)
+	return bead_density.return_density_opt(coords, radius, mass, n_breaks)
 
 def scale(v):
 	return (v - min(v)) / (max(v) - min(v))
@@ -39,6 +37,126 @@ def get_file_type(input):
 		i = i+1
 	return file_type
 
+def get_bead_spread(arguments):
+	coords, mass, radius, grid, bead_density, n_breaks = arguments
+	# dummy function to call main_density_calc for parallelization
+	density = main_density_calc(coords, mass, radius, bead_density, n_breaks)
+	spread = calc_bead_spread(density, grid)
+	return spread
+
+def run_prism( coords, mass, radius, ps_names, args, output_dir = None ):	
+
+	if output_dir is None:
+		output_dir = args.output
+
+	models = round(args.models*coords.shape[0])
+	if args.models != 1:
+		selected_models = np.random.choice(coords.shape[0], models, replace=False)
+		coords = coords[selected_models]
+	print("Number of Models = {}".format(coords.shape[0]))
+	print("Number of Beads = {}".format(coords.shape[1]))
+
+	# Create the grid.
+	grid = SparseGrid(voxel_size=args.voxel_size)
+	grid.create_grid(coords)
+	# Not padding the grid.
+	grid.pad_grid(0)
+	
+	cores_ = min(max(os.cpu_count() - 1, 1), args.cores)
+	chunksize, extra = divmod(coords.shape[1], cores_ * 4)
+	if extra:
+		chunksize += 1
+	bead_density = BeadDensity(coords.shape[0], grid=grid, voxel_size=args.voxel_size)
+	with Pool(cores_) as p:
+		bead_spread = []
+		arguments = [(coords[:,i,:], mass[i], radius[i], grid, bead_density, args.n_breaks) for i in range(coords.shape[1])]
+		for spread in tqdm.tqdm( p.imap( get_bead_spread, arguments, chunksize=chunksize ) ):
+			bead_spread.append( spread )
+	bead_spread = scale(bead_spread)
+	print('Bead Spread calculation done')
+
+	# If not specified create a default output directory.
+	os.makedirs(output_dir, exist_ok=True)
+
+	# Save the bead_spread values.
+	if args.return_spread == 1:
+		with open(output_dir + "/bead_spreads_cl" + str(args.classes) + ".txt", "w") as fl:
+			for bs in bead_spread:
+				fl.write('{:0.3f}'.format(bs))
+				fl.write("\n")
+	
+	# Obtain patches for all the beads.
+	patches = get_patches(bead_spread, args.classes, coords, radius, cores_)
+	# Annotate the patches for low-med-high precision.
+	annotated_patches = annotate_patches(patches, args.classes, ps_names, coords.shape[1])
+	high_prec, low_prec = patches[:args.classes], patches[args.classes+1:]
+
+	annot_df = pd.DataFrame(np.array(annotated_patches), columns = ['Bead', 'Bead Name', 'Type', 'Class', 'Patch'])
+	annot_df['Patch'] = pd.to_numeric(annot_df["Patch"])
+	annot_df.sort_values(['Patch'], ascending=[True])
+	annot_df.to_csv(output_dir + '/annotations_cl' + str(args.classes) + '.txt', index=None)
+
+	with open(output_dir + "/low_prec_cl" + str(args.classes) + ".txt", "w") as fl:
+		lev = 1
+		fl.write("Level" + "\t" + "Bead Indices" + "\t" + "Bead Names")
+		fl.write("\n")
+		for level in low_prec:
+			for l in level:
+				fl.write(str(lev))
+				fl.write("\t")
+				fl.write(",".join(str(item) for item in l))
+				fl.write("\t")
+				fl.write(",".join(ps_names[name] for name in l))
+				fl.write("\n")
+			lev=lev+1
+
+	with open(output_dir + "/high_prec_cl" + str(args.classes) + ".txt", "w") as fl:
+		lev = 1
+		fl.write("Level" + "\t" + "Bead Indices" + "\t" + "Bead Names")
+		fl.write("\n")
+		for level in high_prec:
+			for l in level:
+				fl.write(str(lev))
+				fl.write("\t")
+				fl.write(",".join(str(item) for item in l))
+				fl.write("\t")
+				fl.write(",".join(ps_names[name] for name in l))
+				fl.write("\n")
+			lev=lev+1
+
+def run_prism_ihm(coords, mass, radius, ps_names, n_breaks=50, voxel_size=2, classes=2, cores=4):
+	"""Custom processing function for PDB-IHM"""
+	# Create the grid.
+	grid = SparseGrid(voxel_size=voxel_size)
+	grid.create_grid(coords)
+	# Not padding the grid.
+	grid.pad_grid(0)
+
+	cores_ = min(max(os.cpu_count() - 1, 1), cores)
+	chunksize, extra = divmod(coords.shape[1], cores_ * 4)
+	if extra:
+		chunksize += 1
+	bead_density = BeadDensity(coords.shape[0], grid=grid, voxel_size=voxel_size)
+	with Pool(cores_) as p:
+		bead_spread = []
+		arguments = [(coords[:,i,:], mass[i], radius[i], grid, bead_density, n_breaks) for i in range(coords.shape[1])]
+		for spread in tqdm.tqdm( p.imap( get_bead_spread, arguments, chunksize=chunksize ), total=coords.shape[1]):
+			bead_spread.append( spread )
+	bead_spread = scale(np.asarray(bead_spread, dtype=float))
+	logging.info('Bead Spread calculation done')
+
+	# Obtain patches for all the beads.
+	patches = get_patches(bead_spread[:coords.shape[1]], classes, coords, radius, cores_)
+	# Annotate the patches for low-med-high precision.
+	annotated_patches = annotate_patches(patches, classes, ps_names, coords.shape[1])
+
+	annot_df = pd.DataFrame(np.array(annotated_patches), columns = ['Bead', 'Bead Name', 'Type', 'Class', 'Patch'])
+	annot_df['Patch'] = pd.to_numeric(annot_df["Patch"])
+	annot_df['x'] = coords[0][:, 0]
+	annot_df['y'] = coords[0][:, 1]
+	annot_df['z'] = coords[0][:, 2]
+	annot_df['r'] = radius[:coords.shape[1]]
+	return(annot_df)
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser("PrISM")
@@ -73,6 +191,7 @@ if __name__ == '__main__':
 		coords, mass, radius, ps_names = parse_all_struct(args.input, _type = "cif" )
 		run_prism( coords, mass, radius, ps_names, args )
 	elif args.input_type == "ihm":
+		from ihm_parser import parse_ihm_models
 		parse_ihm_models( args )
 	elif args.input_type == "rmf":
 		from rmf_parser import parse_all_rmfs
@@ -83,117 +202,3 @@ if __name__ == '__main__':
 		coords, mass, radius, ps_names = parse_all_dcds(args.input, args.resolution, args.subunit, args.selection)
 		run_prism( coords, mass, radius, ps_names, args )
 	
-def run_prism( coords, mass, radius, ps_names, args, output_dir = None ):	
-	models = round(args.models*coords.shape[0])
-	if args.models != 1:
-		selected_models = np.random.choice(coords.shape[0], models, replace=False)
-		coords = coords[selected_models]
-	print("Number of Models = {}".format(coords.shape[0]))
-	print("Number of Beads = {}".format(coords.shape[1]))
-
-	# Create the grid.
-	grid = SparseGrid(voxel_size=args.voxel_size)
-	grid.create_grid(coords)
-	# Not padding the grid.
-	grid.pad_grid(0)
-	
-	with Pool(args.cores) as p:
-		densities = []
-		for density in tqdm.tqdm( p.imap( partial(main_density_calc, coords=coords, mass=mass, radius=radius, grid=grid, voxel_size=args.voxel_size, n_breaks=args.n_breaks), range(0, coords.shape[1] ) ) ):
-			densities.append( density )
-	print('Density calculation done')
-
-	with Pool(args.cores) as p:
-		bead_spread = []
-		for spread in tqdm.tqdm( p.map( partial(calc_bead_spread, grid=grid), densities)  ):
-			bead_spread.append( spread )
-	bead_spread = scale(bead_spread)
-	print('Bead Spread calculation done')
-
-	# If not specified create a default output directory.
-	if not os.path.exists(args.output) and output_dir == None:
-		os.makedirs(args.output)
-	else:
-		args.output = output_dir
-		os.makedirs(args.output)
-
-	# Save the bead_spread values.
-	if args.return_spread == 1:
-		with open(args.output + "/bead_spreads_cl" + str(args.classes) + ".txt", "w") as fl:
-			for bs in bead_spread:
-				fl.write('{:0.3f}'.format(bs))
-				fl.write("\n")
-	
-	# Obtain patches for all the beads.
-	patches = get_patches(bead_spread, args.classes, coords, radius)
-	# Annotate the patches for low-med-high precision.
-	annotated_patches = annotate_patches(patches, args.classes, ps_names, coords.shape[1])
-	high_prec, low_prec = patches[:args.classes], patches[args.classes+1:]
-
-	annot_df = pd.DataFrame(np.array(annotated_patches), columns = ['Bead', 'Bead Name', 'Type', 'Class', 'Patch'])
-	annot_df['Patch'] = pd.to_numeric(annot_df["Patch"])
-	annot_df.sort_values(['Patch'], ascending=[True])
-	annot_df.to_csv(args.output + '/annotations_cl' + str(args.classes) + '.txt', index=None)
-
-	with open(args.output + "/low_prec_cl" + str(args.classes) + ".txt", "w") as fl:
-		lev = 1
-		fl.write("Level" + "\t" + "Bead Indices" + "\t" + "Bead Names")
-		fl.write("\n")
-		for level in low_prec:
-			for l in level:
-				fl.write(str(lev))
-				fl.write("\t")
-				fl.write(",".join(str(item) for item in l))
-				fl.write("\t")
-				fl.write(",".join(ps_names[name] for name in l))
-				fl.write("\n")
-			lev=lev+1
-
-	with open(args.output + "/high_prec_cl" + str(args.classes) + ".txt", "w") as fl:
-		lev = 1
-		fl.write("Level" + "\t" + "Bead Indices" + "\t" + "Bead Names")
-		fl.write("\n")
-		for level in high_prec:
-			for l in level:
-				fl.write(str(lev))
-				fl.write("\t")
-				fl.write(",".join(str(item) for item in l))
-				fl.write("\t")
-				fl.write(",".join(ps_names[name] for name in l))
-				fl.write("\n")
-			lev=lev+1
-
-
-def run_prism_ihm(coords, mass, radius, ps_names, n_breaks=50, voxel_size=2, classes=2, cores=4):
-	"""Custom processing function for PDB-IHM"""
-    # Create the grid.
-	grid = SparseGrid(voxel_size=voxel_size)
-	grid.create_grid(coords)
-	# Not padding the grid.
-	grid.pad_grid(0)
-
-	with Pool(cores) as p:
-		densities = []
-		for density in tqdm.tqdm( p.imap( partial(main_density_calc, coords=coords, mass=mass, radius=radius, grid=grid, voxel_size=voxel_size, n_breaks=n_breaks), range(0, coords.shape[1] ) ), total=coords.shape[1]):
-			densities.append( density )
-	logging.info('Density calculation done')
-
-	with Pool(cores) as p:
-		bead_spread = []
-		for spread in tqdm.tqdm( p.map( partial(calc_bead_spread, grid=grid), densities), total=len(densities)):
-			bead_spread.append( spread )
-	bead_spread = scale(np.asarray(bead_spread, dtype=float))
-	logging.info('Bead Spread calculation done')
-
-	# Obtain patches for all the beads.
-	patches = get_patches(bead_spread[:coords.shape[1]], classes, coords, radius)
-	# Annotate the patches for low-med-high precision.
-	annotated_patches = annotate_patches(patches, classes, ps_names, coords.shape[1])
-
-	annot_df = pd.DataFrame(np.array(annotated_patches), columns = ['Bead', 'Bead Name', 'Type', 'Class', 'Patch'])
-	annot_df['Patch'] = pd.to_numeric(annot_df["Patch"])
-	annot_df['x'] = coords[0][:, 0]
-	annot_df['y'] = coords[0][:, 1]
-	annot_df['z'] = coords[0][:, 2]
-	annot_df['r'] = radius[:coords.shape[1]]
-	return(annot_df)
