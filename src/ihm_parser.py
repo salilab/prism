@@ -287,10 +287,16 @@ def parse_ihm_models( args ):
 					ihm_set_bfactor( f"output_{ist}_{img}", mmcif, mg )
 
 
-def get_all_attributes_ihm(models) -> list:
-	"""Extract information from models in an ihm.model.ModelGroup"""
+def get_all_attributes_ihm(models, with_ids=False) -> list:
+	"""Extract information from models in an ihm.model.ModelGroup.
+
+	Returns [coords, radius, mass, ps_names]; with with_ids=True also
+	bead_ids, one (asym_id, seq_id_begin, seq_id_end, kind) tuple per bead of
+	the first model, kind being "sphere" or "atom". The 4-value default is
+	what IHMValidation releases before 3.3 unpack.
+	"""
     # Get the x, y, z coords and radius for all models.
-	coords, radius, mass, ps_names = [], [], [], []
+	coords, radius, mass, ps_names, bead_ids = [], [], [], [], []
 	avg_mass = 110
 	avg_radius = 2.73
 
@@ -307,6 +313,11 @@ def get_all_attributes_ihm(models) -> list:
 			if isinstance(obj, ihm.model.Sphere) or (isinstance(obj, ihm.model.Atom) and obj.atom_id == 'CA'):
 				num_spheres += 1
 				coords.append( [obj.x, obj.y, obj.z])
+				if with_ids and num_models == 1:
+					if isinstance(obj, ihm.model.Sphere):
+						bead_ids.append( (obj.asym_unit._id, int(obj.seq_id_range[0]), int(obj.seq_id_range[1]), 'sphere') )
+					else:
+						bead_ids.append( (obj.asym_unit._id, int(obj.seq_id), int(obj.seq_id), 'atom') )
 				try:
 					n_res = obj.seq_id_range
 					bead_mass = 110 if n_res[0] == n_res[1] else ( n_res[1] - n_res[0] + 1 )*110
@@ -322,4 +333,6 @@ def get_all_attributes_ihm(models) -> list:
 	coords = np.array( coords ).reshape( num_models, num_spheres, 3 )
 	radius = np.array( radius ).reshape( num_models*num_spheres, 1 )
 	mass = np.array( mass ).reshape( num_models*num_spheres, 1 )
+	if with_ids:
+		return [coords, radius, mass, ps_names, bead_ids]
 	return [coords, radius, mass, ps_names]

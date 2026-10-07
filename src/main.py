@@ -124,8 +124,13 @@ def run_prism( coords, mass, radius, ps_names, args, output_dir = None ):
 				fl.write("\n")
 			lev=lev+1
 
-def run_prism_ihm(coords, mass, radius, ps_names, n_breaks=50, voxel_size=2, classes=2, cores=4):
-	"""Custom processing function for PDB-IHM"""
+def run_prism_ihm(coords, mass, radius, ps_names, n_breaks=50, voxel_size=2, classes=2, cores=4, bead_ids=None):
+	"""Custom processing function for PDB-IHM.
+
+	With bead_ids from ihm_parser.get_all_attributes_ihm, the dataframe also
+	says which residue each bead is: asym_id, seq_id_begin, seq_id_end and
+	kind ("sphere" or "atom").
+	"""
 	# Create the grid.
 	grid = SparseGrid(voxel_size=voxel_size)
 	grid.create_grid(coords)
@@ -156,6 +161,11 @@ def run_prism_ihm(coords, mass, radius, ps_names, n_breaks=50, voxel_size=2, cla
 	annot_df['y'] = coords[0][:, 1]
 	annot_df['z'] = coords[0][:, 2]
 	annot_df['r'] = radius[:coords.shape[1]]
+	if bead_ids is not None:
+		annot_df['asym_id'] = [b[0] for b in bead_ids]
+		annot_df['seq_id_begin'] = np.array([b[1] for b in bead_ids], dtype=int)
+		annot_df['seq_id_end'] = np.array([b[2] for b in bead_ids], dtype=int)
+		annot_df['kind'] = [b[3] for b in bead_ids]
 	return(annot_df)
 
 if __name__ == '__main__':
